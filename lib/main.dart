@@ -13,7 +13,8 @@ const canvas = Color(0xFFF4F7F7);
 
 String money(num value) {
   final n = value.toStringAsFixed(0);
-  return n.replaceAllMapped(RegExp(r'\B(?=(\d{3})+(?!\d))'), (_) => ',') + ' ج.م';
+  final formatted = n.replaceAllMapped(RegExp(r'\B(?=(\d{3})+(?!\d))'), (_) => ',');
+  return '$formatted ج.م';
 }
 
 double number(String raw) => double.tryParse(raw.replaceAll(',', '').trim()) ?? 0;
