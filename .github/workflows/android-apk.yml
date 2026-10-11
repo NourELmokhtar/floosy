@@ -13,7 +13,11 @@ jobs:
           channel: stable
       - run: flutter create --platforms=android --project-name floosy .
       - run: flutter pub get
-      - run: flutter analyze
+      # flutter create generates the default MyApp widget test, but this app uses FloosyApp.
+      - name: Remove generated template test
+        run: rm -f test/widget_test.dart
+      - name: Analyze Flutter project
+        run: flutter analyze
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
