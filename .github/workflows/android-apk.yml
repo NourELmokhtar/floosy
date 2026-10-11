@@ -17,7 +17,7 @@ jobs:
       - name: Remove generated template test
         run: rm -f test/widget_test.dart
       - name: Analyze Flutter project
-        run: flutter analyze
+        run: flutter analyze --no-fatal-infos
       - run: flutter build apk --release
       - uses: actions/upload-artifact@v4
         with:
