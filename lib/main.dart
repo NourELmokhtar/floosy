@@ -43,6 +43,47 @@ class Goal {
   Map<String, dynamic> toMap() => {'name': name, 'target': target, 'saved': saved};
 }
 
+class AssociationPlan {
+  final String id;
+  String name;
+  double monthlyPayment;
+  double collectionAmount;
+  int dueDay;
+  DateTime startsOn, endsOn, collectsOn;
+  AssociationPlan({required this.id, required this.name, required this.monthlyPayment,
+    required this.collectionAmount, required this.dueDay, required this.startsOn,
+    required this.endsOn, required this.collectsOn});
+  factory AssociationPlan.fromMap(Map<String, dynamic> m) => AssociationPlan(
+    id: m['id'] as String, name: m['name'] as String,
+    monthlyPayment: (m['monthlyPayment'] as num).toDouble(),
+    collectionAmount: (m['collectionAmount'] as num).toDouble(),
+    dueDay: (m['dueDay'] as num).toInt(),
+    startsOn: DateTime.parse(m['startsOn'] as String),
+    endsOn: DateTime.parse(m['endsOn'] as String),
+    collectsOn: DateTime.parse(m['collectsOn'] as String),
+  );
+  Map<String, dynamic> toMap() => {
+    'id': id, 'name': name, 'monthlyPayment': monthlyPayment,
+    'collectionAmount': collectionAmount, 'dueDay': dueDay,
+    'startsOn': dateKey(startsOn), 'endsOn': dateKey(endsOn),
+    'collectsOn': dateKey(collectsOn),
+  };
+  DateTime dueDate(int year, int month) {
+    final lastDay = DateTime(year, month + 1, 0).day;
+    return DateTime(year, month, dueDay.clamp(1, lastDay).toInt());
+  }
+  List<DateTime> duesInCycle(DateTime start, DateTime end) {
+    final result = <DateTime>[];
+    for (var offset = -1; offset <= 2; offset++) {
+      final d = dueDate(start.year, start.month + offset);
+      if (!d.isBefore(start) && d.isBefore(end) &&
+          !d.isBefore(DateTime(startsOn.year, startsOn.month)) &&
+          !d.isAfter(DateTime(endsOn.year, endsOn.month + 1, 0))) result.add(d);
+    }
+    return result;
+  }
+}
+
 class FinancialData extends ChangeNotifier {
   final SharedPreferencesAsync prefs = SharedPreferencesAsync();
   bool loading = true, configured = false;
@@ -51,6 +92,7 @@ class FinancialData extends ChangeNotifier {
   String lastSalaryCycle = '';
   List<Entry> entries = [];
   List<Goal> goals = [];
+  List<AssociationPlan> associationPlans = [];
 
   Future<void> load() async {
     try {
@@ -70,6 +112,7 @@ class FinancialData extends ChangeNotifier {
         lastSalaryCycle = m['lastSalaryCycle'] as String? ?? '';
         entries = ((m['entries'] as List?) ?? []).map((e) => Entry.fromMap(Map<String, dynamic>.from(e))).toList();
         goals = ((m['goals'] as List?) ?? []).map((e) => Goal.fromMap(Map<String, dynamic>.from(e))).toList();
+        associationPlans = ((m['associationPlans'] as List?) ?? []).map((e) => AssociationPlan.fromMap(Map<String, dynamic>.from(e))).toList();
       }
     } catch (_) {
       // A malformed local record must not crash the startup screen.
@@ -87,6 +130,7 @@ class FinancialData extends ChangeNotifier {
       'savingsBalance': savingsBalance, 'emergencyBalance': emergencyBalance,
       'lastSalaryCycle': lastSalaryCycle, 'entries': entries.map((e) => e.toMap()).toList(),
       'goals': goals.map((g) => g.toMap()).toList(),
+      'associationPlans': associationPlans.map((a) => a.toMap()).toList(),
     }));
   }
 
@@ -104,9 +148,49 @@ class FinancialData extends ChangeNotifier {
   double get totalCash => openingBalance + incomes - expenses;
   // Savings and emergency balances are earmarked amounts, not extra cash.
   double get usableCash => totalCash - savingsBalance - emergencyBalance - goals.fold(0.0, (a, g) => a + g.saved);
+  String paymentTag(String id, DateTime due) => 'قسط جمعية #$id#${dateKey(due)}';
+  String collectionTag(String id) => 'قبض جمعية #$id';
+  bool isPaymentRecorded(AssociationPlan a, DateTime due) => entries.any(
+      (e) => e.title == paymentTag(a.id, due) && e.kind == 'expense');
+  bool isCollectionRecorded(AssociationPlan a) => entries.any(
+      (e) => e.title == collectionTag(a.id) && e.kind == 'income');
+  double get dueAssociations => associationPlans.fold(0.0, (sum, a) =>
+      sum + a.duesInCycle(periodStart, periodEnd)
+          .where((d) => !isPaymentRecorded(a, d))
+          .length * a.monthlyPayment);
+  double get expectedCollectionThisCycle => associationPlans
+      .where((a) => !a.collectsOn.isBefore(periodStart) &&
+          a.collectsOn.isBefore(periodEnd) && !isCollectionRecorded(a))
+      .fold(0.0, (sum, a) => sum + a.collectionAmount);
+  List<AssociationPlan> get collectionsThisCycle => associationPlans
+      .where((a) => !a.collectsOn.isBefore(periodStart) && a.collectsOn.isBefore(periodEnd)).toList();
+  Future<void> addAssociation(AssociationPlan plan) async {
+    associationPlans.add(plan);
+    await persist();
+  }
+  Future<void> deleteAssociation(String id) async {
+    associationPlans.removeWhere((a) => a.id == id);
+    await persist();
+  }
+  Future<void> recordAssociationPayment(AssociationPlan a, DateTime due) async {
+    if (isPaymentRecorded(a, due)) return;
+    entries.insert(0, Entry(id: DateTime.now().microsecondsSinceEpoch.toString(),
+      title: paymentTag(a.id, due), category: 'جمعيات', date: dateKey(DateTime.now()),
+      kind: 'expense', amount: a.monthlyPayment));
+    await persist();
+  }
+  Future<void> recordAssociationCollection(AssociationPlan a) async {
+    if (isCollectionRecorded(a)) return;
+    entries.insert(0, Entry(id: DateTime.now().microsecondsSinceEpoch.toString(),
+      title: collectionTag(a.id), category: 'قبض جمعية', date: dateKey(DateTime.now()),
+      kind: 'income', amount: a.collectionAmount));
+    await persist();
+  }
   double get periodAvailable {
     final scheduledHome = house - currentEntries.where((e) => e.kind == 'expense' && e.category == 'بيت').fold(0.0, (a, e) => a + e.amount);
-    final scheduledAssociation = associations - currentEntries.where((e) => e.kind == 'expense' && e.category == 'جمعيات').fold(0.0, (a, e) => a + e.amount);
+    // Legacy amount remains reserved until the user replaces it with detailed plans.
+    final scheduledAssociation = associationPlans.isEmpty ?
+      associations - currentEntries.where((e) => e.kind == 'expense' && e.category == 'جمعيات').fold(0.0, (a, e) => a + e.amount) : dueAssociations;
     final foodRemaining = foodBudget - foodSpent;
     return usableCash - [scheduledHome, scheduledAssociation, foodRemaining].fold(0.0, (a, b) => a + (b > 0 ? b : 0));
   }
@@ -209,8 +293,19 @@ class HomeScreen extends StatefulWidget {
 class _HomeScreenState extends State<HomeScreen> {
   int selected = 0;
   @override Widget build(BuildContext context) {
-    final pages = [Dashboard(store: widget.store), TransactionsScreen(store: widget.store), GoalsScreen(store: widget.store), AdvisorScreen(store: widget.store), SettingsScreen(store: widget.store)];
-    return Scaffold(appBar: AppBar(title: Text(['فلوسي', 'العمليات', 'أهدافي', 'مساعد الشراء', 'الإعدادات'][selected])), body: pages[selected], bottomNavigationBar: NavigationBar(selectedIndex: selected, onDestinationSelected: (i) => setState(() => selected = i), destinations: const [NavigationDestination(icon: Icon(Icons.dashboard_outlined), label: 'الرئيسية'), NavigationDestination(icon: Icon(Icons.receipt_long_outlined), label: 'العمليات'), NavigationDestination(icon: Icon(Icons.flag_outlined), label: 'الأهداف'), NavigationDestination(icon: Icon(Icons.lightbulb_outline), label: 'المساعد'), NavigationDestination(icon: Icon(Icons.settings_outlined), label: 'الإعدادات')]));
+    final pages = [Dashboard(store: widget.store), TransactionsScreen(store: widget.store),
+      AssociationsScreen(store: widget.store), GoalsScreen(store: widget.store),
+      AdvisorScreen(store: widget.store), SettingsScreen(store: widget.store)];
+    return Scaffold(appBar: AppBar(title: Text(['فلوسي', 'العمليات', 'الجمعيات', 'أهدافي', 'مساعد الشراء', 'الإعدادات'][selected])),
+      body: pages[selected], bottomNavigationBar: NavigationBar(selectedIndex: selected,
+      onDestinationSelected: (i) => setState(() => selected = i), destinations: const [
+        NavigationDestination(icon: Icon(Icons.dashboard_outlined), label: 'الرئيسية'),
+        NavigationDestination(icon: Icon(Icons.receipt_long_outlined), label: 'العمليات'),
+        NavigationDestination(icon: Icon(Icons.groups_outlined), label: 'الجمعيات'),
+        NavigationDestination(icon: Icon(Icons.flag_outlined), label: 'الأهداف'),
+        NavigationDestination(icon: Icon(Icons.lightbulb_outline), label: 'المساعد'),
+        NavigationDestination(icon: Icon(Icons.settings_outlined), label: 'الإعدادات')],
+      ));
   }
 }
 
@@ -224,7 +319,14 @@ class Dashboard extends StatelessWidget {
       surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('المتاح الآمن بعد الالتزامات', style: TextStyle(color: Colors.black54)), const SizedBox(height: 9), Text(money(store.periodAvailable), style: TextStyle(fontSize: 30, fontWeight: FontWeight.w900, color: store.periodAvailable < 0 ? Colors.red : teal)), const SizedBox(height: 12), Text('الرصيد الحقيقي في حساباتك: ${money(store.totalCash)}'), const SizedBox(height: 12), if (!store.salaryRecorded) FilledButton.icon(onPressed: () => _confirmSalary(context), icon: const Icon(Icons.add), label: Text('تسجيل مرتب الشهر: ${money(store.salary)}')) else const Text('✓ مرتب الدورة الحالية متسجل', style: TextStyle(color: teal))])),
       const SizedBox(height: 12), Row(children: [Expanded(child: metric('مصروفات الدورة', money(store.periodExpenses), Icons.trending_down, color: Colors.deepOrange)), Expanded(child: metric('فلوس محجوزة', money(store.savingsBalance + store.emergencyBalance), Icons.savings_outlined))]),
       const SizedBox(height: 12), surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('ميزانية الأكل', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)), const SizedBox(height: 8), LinearProgressIndicator(value: store.foodBudget > 0 ? (store.foodSpent / store.foodBudget).clamp(0, 1) : 0, minHeight: 10, borderRadius: BorderRadius.circular(8)), const SizedBox(height: 8), Text('${money(store.foodSpent)} من ${money(store.foodBudget)}')])),
-      const SizedBox(height: 12), surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('حسابات مهمة', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)), const SizedBox(height: 8), Text('البيت شهريًا: ${money(store.house)}'), Text('الجمعيات شهريًا: ${money(store.associations)}'), Text('التحويش المتراكم المحجوز: ${money(store.savingsBalance)}'), Text('الطوارئ المحجوزة: ${money(store.emergencyBalance)}')])),
+      const SizedBox(height: 12), surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        const Text('جمعيات الدورة الحالية', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)),
+        const SizedBox(height: 8), Text('أقساط متبقية للسداد: ${money(store.associationPlans.isEmpty ? store.associations : store.dueAssociations)}'),
+        Text('قبض متوقع هذا الشهر: ${money(store.expectedCollectionThisCycle)}', style: const TextStyle(color: teal, fontWeight: FontWeight.bold)),
+        const Text('القبض المتوقع لا يُضاف للرصيد إلا بعد تأكيد استلامه.', style: TextStyle(color: Colors.black54)),
+        ...store.collectionsThisCycle.map((a) => Padding(padding: const EdgeInsets.only(top: 6), child: Text('${a.name}: ${money(a.collectionAmount)} يوم ${dateKey(a.collectsOn)}${store.isCollectionRecorded(a) ? ' (تم القبض)' : ''}'))),
+      ])),
+      const SizedBox(height: 12), surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [const Text('حسابات مهمة', style: TextStyle(fontSize: 17, fontWeight: FontWeight.bold)), const SizedBox(height: 8), Text('البيت شهريًا: ${money(store.house)}'), Text('الجمعيات المستحقة بالدورة: ${money(store.associationPlans.isEmpty ? store.associations : store.dueAssociations)}'), Text('التحويش المتراكم المحجوز: ${money(store.savingsBalance)}'), Text('الطوارئ المحجوزة: ${money(store.emergencyBalance)}')])),
     ]);
   }
   Future<void> _confirmSalary(BuildContext context) async {
@@ -233,7 +335,7 @@ class Dashboard extends StatelessWidget {
   }
 }
 
-const expenseCategories = ['أكل', 'بيت', 'مواصلات', 'فواتير', 'جمعيات', 'ترفيه', 'اشتراكات', 'صحة', 'تسوق', 'أخرى'];
+const expenseCategories = ['أكل', 'بيت', 'مواصلات', 'فواتير', 'ترفيه', 'اشتراكات', 'صحة', 'تسوق', 'أخرى'];
 class TransactionsScreen extends StatelessWidget {
   final FinancialData store;
   const TransactionsScreen({super.key, required this.store});
@@ -247,6 +349,97 @@ class TransactionsScreen extends StatelessWidget {
     String category = expenseCategories.first;
     await showDialog<void>(context: context, builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) => AlertDialog(title: const Text('مصروف جديد'), content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [TextField(controller: title, decoration: const InputDecoration(labelText: 'اسم المصروف')), const SizedBox(height: 12), AmountField('المبلغ', amount), DropdownButtonFormField<String>(initialValue: category, isExpanded: true, decoration: const InputDecoration(labelText: 'التصنيف'), items: expenseCategories.map((c) => DropdownMenuItem(value: c, child: Text(c))).toList(), onChanged: (value) => setLocal(() => category = value ?? category))])), actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')), FilledButton(onPressed: () async { if (number(amount.text) <= 0) return; await store.addEntry(title: title.text.trim().isEmpty ? category : title.text.trim(), category: category, amount: number(amount.text), kind: 'expense'); if (ctx.mounted) Navigator.pop(ctx); }, child: const Text('حفظ'))])));
     title.dispose(); amount.dispose();
+  }
+}
+
+
+class AssociationsScreen extends StatelessWidget {
+  final FinancialData store;
+  const AssociationsScreen({super.key, required this.store});
+  @override Widget build(BuildContext context) => ListView(padding: const EdgeInsets.all(16), children: [
+    FilledButton.icon(onPressed: () => _add(context), icon: const Icon(Icons.add), label: const Padding(
+      padding: EdgeInsets.all(12), child: Text('إضافة جمعية بالتفاصيل'))),
+    const SizedBox(height: 12),
+    surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+      Text('أقساط الدورة المتبقية: ${money(store.dueAssociations)}', style: const TextStyle(fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8), Text('قبض متوقع في الدورة: ${money(store.expectedCollectionThisCycle)}',
+        style: const TextStyle(color: teal, fontWeight: FontWeight.bold)),
+      const SizedBox(height: 8), const Text('تاريخ القبض لا يعني إن الفلوس وصلت. اضغط «تأكيد القبض» لما تستلمها فعلاً.'),
+      if (store.associationPlans.isEmpty && store.associations > 0) Text(
+        'تنبيه: عندك مبلغ جمعيات إجمالي قديم ${money(store.associations)}. بعد ما تضيف أول جمعية بالتفصيل، الاعتماد هيكون على الجمعيات المفصلة فقط.'),
+    ])),
+    if (store.associationPlans.isEmpty) surface(const Text('مفيش جمعيات مسجلة بالتفصيل. أضف أول جمعية من الزر اللي فوق.')),
+    ...store.associationPlans.map((a) {
+      final dues = a.duesInCycle(store.periodStart, store.periodEnd);
+      final collectionNow = !a.collectsOn.isBefore(store.periodStart) && a.collectsOn.isBefore(store.periodEnd);
+      return surface(Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
+        Row(children: [Expanded(child: Text(a.name, style: const TextStyle(fontSize: 19, fontWeight: FontWeight.bold))),
+          IconButton(tooltip: 'حذف الجمعية', icon: const Icon(Icons.delete_outline, color: Colors.redAccent), onPressed: () async {
+            final confirm = await showDialog<bool>(context: context, builder: (c) => AlertDialog(
+              title: const Text('حذف الجمعية؟'), content: const Text('هيتم حذف الخطة، لكن العمليات اللي اتسجلت بالفعل هتفضل محفوظة في الحسابات.'),
+              actions: [TextButton(onPressed: () => Navigator.pop(c, false), child: const Text('إلغاء')),
+                FilledButton(onPressed: () => Navigator.pop(c, true), child: const Text('حذف'))]));
+            if (confirm == true) await store.deleteAssociation(a.id);
+          })]),
+        Text('القسط الشهري: ${money(a.monthlyPayment)} يوم ${a.dueDay}'),
+        Text('الفترة: ${dateKey(a.startsOn)} إلى ${dateKey(a.endsOn)}'),
+        Text('القبض: ${money(a.collectionAmount)} بتاريخ ${dateKey(a.collectsOn)}', style: const TextStyle(color: teal)),
+        for (final due in dues) Padding(padding: const EdgeInsets.only(top: 8), child: Row(children: [
+          Expanded(child: Text('قسط ${dateKey(due)} ${store.isPaymentRecorded(a, due) ? '✓ مدفوع' : '• مستحق'}')),
+          if (!store.isPaymentRecorded(a, due)) OutlinedButton(onPressed: () => store.recordAssociationPayment(a, due), child: const Text('تأكيد الدفع')),
+        ])),
+        if (collectionNow) Padding(padding: const EdgeInsets.only(top: 10), child:
+          store.isCollectionRecorded(a) ? const Text('✓ تم تسجيل قبض الجمعية', style: TextStyle(color: teal)) :
+          FilledButton.icon(onPressed: () => store.recordAssociationCollection(a),
+            icon: const Icon(Icons.check), label: const Text('تأكيد قبض الجمعية'))),
+      ]));
+    }),
+  ]);
+
+  Future<void> _add(BuildContext context) async {
+    final name = TextEditingController(), payment = TextEditingController(), collection = TextEditingController();
+    var dueDay = 1;
+    var starts = DateTime(DateTime.now().year, DateTime.now().month, 1);
+    var ends = DateTime(DateTime.now().year, DateTime.now().month + 11, 1);
+    var collects = DateTime(DateTime.now().year, DateTime.now().month, 1);
+    Future<void> pickDate(BuildContext ctx, DateTime initial, void Function(DateTime) setDate) async {
+      final picked = await showDatePicker(context: ctx, initialDate: initial,
+        firstDate: DateTime(2020), lastDate: DateTime(2100));
+      if (picked != null) setDate(picked);
+    }
+    await showDialog<void>(context: context, builder: (ctx) => StatefulBuilder(builder: (ctx, setLocal) => AlertDialog(
+      title: const Text('جمعية جديدة'),
+      content: SingleChildScrollView(child: Column(mainAxisSize: MainAxisSize.min, children: [
+        TextField(controller: name, decoration: const InputDecoration(labelText: 'اسم الجمعية')),
+        const SizedBox(height: 12), AmountField('القسط الشهري', payment),
+        AmountField('المبلغ اللي هتقبضه', collection),
+        DropdownButtonFormField<int>(initialValue: dueDay, decoration: const InputDecoration(labelText: 'يوم دفع القسط'),
+          items: List.generate(31, (i) => DropdownMenuItem(value: i + 1, child: Text('${i + 1}'))),
+          onChanged: (v) => setLocal(() => dueDay = v ?? dueDay)),
+        ListTile(title: const Text('أول شهر جمعية'), subtitle: Text(dateKey(starts)), trailing: const Icon(Icons.date_range),
+          onTap: () => pickDate(ctx, starts, (v) => setLocal(() => starts = v))),
+        ListTile(title: const Text('آخر شهر جمعية'), subtitle: Text(dateKey(ends)), trailing: const Icon(Icons.date_range),
+          onTap: () => pickDate(ctx, ends, (v) => setLocal(() => ends = v))),
+        ListTile(title: const Text('تاريخ قبض الجمعية'), subtitle: Text(dateKey(collects)), trailing: const Icon(Icons.date_range),
+          onTap: () => pickDate(ctx, collects, (v) => setLocal(() => collects = v))),
+      ])),
+      actions: [TextButton(onPressed: () => Navigator.pop(ctx), child: const Text('إلغاء')),
+        FilledButton(onPressed: () async {
+          if (name.text.trim().isEmpty || number(payment.text) <= 0 || number(collection.text) <= 0 ||
+            DateTime(ends.year, ends.month).isBefore(DateTime(starts.year, starts.month)) ||
+            DateTime(collects.year, collects.month).isBefore(DateTime(starts.year, starts.month)) ||
+            DateTime(collects.year, collects.month).isAfter(DateTime(ends.year, ends.month))) {
+              ScaffoldMessenger.of(context).showSnackBar(const SnackBar(content: Text('راجع اسم الجمعية والمبالغ والتواريخ')));
+              return;
+          }
+          await store.addAssociation(AssociationPlan(id: DateTime.now().microsecondsSinceEpoch.toString(),
+            name: name.text.trim(), monthlyPayment: number(payment.text),
+            collectionAmount: number(collection.text), dueDay: dueDay,
+            startsOn: starts, endsOn: ends, collectsOn: collects));
+          if (ctx.mounted) Navigator.pop(ctx);
+        }, child: const Text('حفظ الجمعية'))],
+    )));
+    name.dispose(); payment.dispose(); collection.dispose();
   }
 }
 
